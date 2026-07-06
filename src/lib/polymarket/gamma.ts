@@ -23,11 +23,14 @@ export async function fetchActiveMarkets(
   options: FetchActiveMarketsOptions = {}
 ): Promise<NormalizedMarket[]> {
   const limit = options.limit ?? 300;
-  const eventPageSize = options.pageSize ?? 50;
+  // Small event pages -- a single popular event can bundle 50+ markets, so a
+  // large event-page size can overshoot `limit` by several hundred markets
+  // before the outer loop gets a chance to stop.
+  const eventPageSize = options.pageSize ?? 20;
   const results: NormalizedMarket[] = [];
   const seen = new Set<string>();
 
-  for (let offset = 0; results.length < limit && offset < limit * 5; offset += eventPageSize) {
+  outer: for (let offset = 0; results.length < limit && offset < limit * 5; offset += eventPageSize) {
     const url = new URL(`${GAMMA_BASE}/events`);
     url.searchParams.set("active", "true");
     url.searchParams.set("closed", "false");
@@ -53,6 +56,8 @@ export async function fetchActiveMarkets(
       const category = parsedEvent.data.tags[0]?.label ?? null;
 
       for (const rawMarket of parsedEvent.data.markets) {
+        if (results.length >= limit) break outer;
+
         const normalized = normalizeGammaMarket(rawMarket, category);
         if (normalized && !seen.has(normalized.conditionId)) {
           seen.add(normalized.conditionId);
