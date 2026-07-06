@@ -12,15 +12,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Call /api/cron/cycle
+        env:
+          BOT_URL: ${{ secrets.BOT_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
           set -e
-          if [ -z "${{ secrets.BOT_URL }}" ] || [ -z "${{ secrets.CRON_SECRET }}" ]; then
+          if [ -z "$BOT_URL" ] || [ -z "$CRON_SECRET" ]; then
             echo "BOT_URL and/or CRON_SECRET repository secrets are not set. See README.md."
             exit 1
           fi
-          http_code=$(curl -s -o response.json -w "%{http_code}" -X POST \
-            "${{ secrets.BOT_URL }}/api/cron/cycle" \
-            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}")
+          # Strip any trailing slash so we never build a double-slash path
+          # (Vercel 308-redirects those, which curl won't follow by default).
+          clean_url="${BOT_URL%/}"
+          http_code=$(curl -sL -o response.json -w "%{http_code}" -X POST \
+            "$clean_url/api/cron/cycle" \
+            -H "Authorization: Bearer $CRON_SECRET")
           echo "HTTP status: $http_code"
           cat response.json
           if [ "$http_code" -ge 300 ]; then
