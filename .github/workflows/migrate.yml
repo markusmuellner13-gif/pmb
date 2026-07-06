@@ -3,7 +3,8 @@ name: Apply database migrations
 # Manual only -- run this once after first deploying, and again any time the
 # schema changes. Requires TURSO_DATABASE_URL and TURSO_AUTH_TOKEN repository secrets.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs: {}
 
 jobs:
   migrate:
