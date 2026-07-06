@@ -1,0 +1,19 @@
+name: Debug - inspect Gamma API market shape
+
+# Temporary diagnostic, manual only. Dumps one real market's raw JSON so we
+# can confirm real field names (category/tags/etc) instead of guessing.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch one market and a few by volume
+        run: |
+          echo "--- single market, raw ---"
+          curl -s "https://gamma-api.polymarket.com/markets?limit=1&active=true&closed=false" | head -c 4000
+          echo
+          echo "--- top 5 by volume, question+category-ish fields only ---"
+          curl -s "https://gamma-api.polymarket.com/markets?limit=5&active=true&closed=false&order=volume24hr&ascending=false" \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const m=JSON.parse(d);for(const x of m){console.log(JSON.stringify({question:x.question,category:x.category,tags:x.tags,events:x.events?.map(e=>({title:e.title,tags:e.tags})) }));}})"
