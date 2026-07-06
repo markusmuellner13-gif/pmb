@@ -1,16 +1,21 @@
-import { gammaMarketSchema, type NormalizedMarket } from "./types";
+import { gammaEventSchema, gammaMarketSchema, type NormalizedMarket } from "./types";
 
 const GAMMA_BASE = process.env.POLYMARKET_GAMMA_URL ?? "https://gamma-api.polymarket.com";
 
 interface FetchActiveMarketsOptions {
-  /** Total number of markets to pull across pages, ranked by 24h volume. */
+  /** Total number of normalized binary markets to collect, ranked by 24h volume. */
   limit?: number;
   pageSize?: number;
 }
 
 /**
  * Pulls the most active binary (Yes/No) markets from Polymarket's public
- * Gamma API, paginating until `limit` is reached. Markets that don't parse
+ * Gamma API. Markets are fetched via the `/events` endpoint (not `/markets`
+ * directly) specifically to get each market's category from its parent
+ * event's `tags` -- the flat `/markets` endpoint has no category field at
+ * all. Paginates over events (not markets) until `limit` normalized markets
+ * have been collected; a single popular event can bundle 50+ markets, so
+ * page counts don't map 1:1 to market counts. Markets that don't parse
  * cleanly or aren't a simple Yes/No pair are skipped rather than aborting
  * the whole scan.
  */
@@ -18,17 +23,18 @@ export async function fetchActiveMarkets(
   options: FetchActiveMarketsOptions = {}
 ): Promise<NormalizedMarket[]> {
   const limit = options.limit ?? 300;
-  const pageSize = Math.min(options.pageSize ?? 100, limit);
+  const eventPageSize = options.pageSize ?? 50;
   const results: NormalizedMarket[] = [];
+  const seen = new Set<string>();
 
-  for (let offset = 0; offset < limit; offset += pageSize) {
-    const url = new URL(`${GAMMA_BASE}/markets`);
+  for (let offset = 0; results.length < limit && offset < limit * 5; offset += eventPageSize) {
+    const url = new URL(`${GAMMA_BASE}/events`);
     url.searchParams.set("active", "true");
     url.searchParams.set("closed", "false");
     url.searchParams.set("archived", "false");
     url.searchParams.set("order", "volume24hr");
     url.searchParams.set("ascending", "false");
-    url.searchParams.set("limit", String(Math.min(pageSize, limit - offset)));
+    url.searchParams.set("limit", String(eventPageSize));
     url.searchParams.set("offset", String(offset));
 
     const res = await fetch(url, {
@@ -41,12 +47,21 @@ export async function fetchActiveMarkets(
     const body = (await res.json()) as unknown[];
     if (!Array.isArray(body) || body.length === 0) break;
 
-    for (const raw of body) {
-      const normalized = normalizeGammaMarket(raw);
-      if (normalized) results.push(normalized);
+    for (const rawEvent of body) {
+      const parsedEvent = gammaEventSchema.safeParse(rawEvent);
+      if (!parsedEvent.success) continue;
+      const category = parsedEvent.data.tags[0]?.label ?? null;
+
+      for (const rawMarket of parsedEvent.data.markets) {
+        const normalized = normalizeGammaMarket(rawMarket, category);
+        if (normalized && !seen.has(normalized.conditionId)) {
+          seen.add(normalized.conditionId);
+          results.push(normalized);
+        }
+      }
     }
 
-    if (body.length < pageSize) break;
+    if (body.length < eventPageSize) break;
   }
 
   return results;
@@ -86,7 +101,7 @@ export async function fetchMarketsByConditionIds(
   return result;
 }
 
-function normalizeGammaMarket(raw: unknown): NormalizedMarket | null {
+function normalizeGammaMarket(raw: unknown, category: string | null = null): NormalizedMarket | null {
   const parsed = gammaMarketSchema.safeParse(raw);
   if (!parsed.success) return null;
   const m = parsed.data;
@@ -110,7 +125,7 @@ function normalizeGammaMarket(raw: unknown): NormalizedMarket | null {
     conditionId,
     slug: m.slug,
     question: m.question,
-    category: m.category ?? null,
+    category,
     endDate: m.endDate ? new Date(m.endDate) : null,
     active: m.active,
     closed: m.closed,

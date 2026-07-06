@@ -93,6 +93,8 @@ export const positions = sqliteTable(
       .references(() => markets.id),
     outcome: text("outcome").notNull(), // "YES" | "NO" | "ARB_BOTH"
     strategyType: text("strategy_type").notNull().default("MOMENTUM"), // "ARBITRAGE" | "MOMENTUM"
+    category: text("category"), // snapshot of the market's category at entry, for learning-by-category
+    isExploration: integer("is_exploration", { mode: "boolean" }).notNull().default(false),
     mode: text("mode").notNull(), // "paper" | "live"
     status: text("status").notNull().default("open"), // "open" | "closed"
     entryPrice: real("entry_price").notNull(),

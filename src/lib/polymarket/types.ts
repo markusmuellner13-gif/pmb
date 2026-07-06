@@ -28,7 +28,6 @@ export const gammaMarketSchema = z.object({
   conditionId: z.string().optional(),
   question: z.string(),
   slug: z.string().optional().default(""),
-  category: z.string().nullable().optional(),
   active: z.boolean().optional().default(true),
   closed: z.boolean().optional().default(false),
   archived: z.boolean().optional().default(false),
@@ -46,6 +45,24 @@ export const gammaMarketSchema = z.object({
 });
 
 export type GammaMarket = z.infer<typeof gammaMarketSchema>;
+
+/**
+ * Categories don't live on the market object -- they live on the parent
+ * "event" (Polymarket's grouping of related markets) as a `tags` array,
+ * broadest tag first (e.g. "Sports" before "Soccer" before "FIFA World Cup").
+ * Confirmed against the live API; see git history for the diagnostic.
+ */
+export const gammaEventSchema = z.object({
+  id: z.string().optional(),
+  title: z.string().optional(),
+  tags: z
+    .array(z.object({ label: z.string().optional() }))
+    .optional()
+    .default([]),
+  markets: z.array(z.unknown()).optional().default([]),
+});
+
+export type GammaEvent = z.infer<typeof gammaEventSchema>;
 
 /** Normalized, binary (Yes/No) market ready for the strategy engine. */
 export interface NormalizedMarket {

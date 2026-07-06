@@ -23,6 +23,7 @@ export default async function PositionsPage() {
           <thead>
             <tr className="border-b border-[var(--border-hairline)] text-xs uppercase tracking-wide text-text-muted">
               <th className="px-4 py-3 font-medium">Market</th>
+              <th className="px-4 py-3 font-medium">Category</th>
               <th className="px-4 py-3 font-medium">Side</th>
               <th className="px-4 py-3 font-medium">Entry</th>
               <th className="px-4 py-3 font-medium">Size</th>
@@ -34,7 +35,7 @@ export default async function PositionsPage() {
           <tbody className="divide-y divide-[var(--border-hairline)]">
             {open.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-4 py-8 text-center text-text-muted">
+                <td colSpan={8} className="px-4 py-8 text-center text-text-muted">
                   No open positions right now.
                 </td>
               </tr>
@@ -42,10 +43,16 @@ export default async function PositionsPage() {
             {open.map(({ position, market }) => (
               <tr key={position.id}>
                 <td className="max-w-xs truncate px-4 py-3 text-text-primary">{market.question}</td>
+                <td className="px-4 py-3 text-xs text-text-muted">
+                  {position.category ?? "Uncategorized"}
+                </td>
                 <td className="px-4 py-3">
-                  <Badge tone={position.outcome === "ARB_BOTH" ? "warning" : "blue"}>
-                    {position.outcome === "ARB_BOTH" ? "ARB" : position.outcome}
-                  </Badge>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Badge tone={position.outcome === "ARB_BOTH" ? "warning" : "blue"}>
+                      {position.outcome === "ARB_BOTH" ? "ARB" : position.outcome}
+                    </Badge>
+                    {position.isExploration && <Badge tone="neutral">explore</Badge>}
+                  </div>
                 </td>
                 <td className="tabular px-4 py-3 text-text-secondary">
                   {position.entryPrice.toFixed(3)}

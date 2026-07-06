@@ -10,6 +10,7 @@ export interface OpenPaperPositionParams {
   opportunity: ScoredOpportunity;
   strategyType: StrategyType;
   sizeUsd: number;
+  isExploration?: boolean;
 }
 
 /**
@@ -19,7 +20,7 @@ export interface OpenPaperPositionParams {
  * single side. Cash is debited immediately, same as a real fill would.
  */
 export async function openPaperPosition(params: OpenPaperPositionParams) {
-  const { market, opportunity, strategyType, sizeUsd } = params;
+  const { market, opportunity, strategyType, sizeUsd, isExploration = false } = params;
 
   return db.transaction(async (tx) => {
     const cfgRows = await tx.select().from(botConfig).where(eq(botConfig.id, 1));
@@ -47,6 +48,8 @@ export async function openPaperPosition(params: OpenPaperPositionParams) {
         marketId: market.conditionId,
         outcome: opportunity.side,
         strategyType,
+        category: market.category,
+        isExploration,
         mode: "paper",
         status: "open",
         entryPrice,

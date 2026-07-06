@@ -8,6 +8,13 @@
       "when": 1783376019931,
       "tag": "0000_pink_red_ghost",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1783379591923,
+      "tag": "0001_flawless_skullbuster",
+      "breakpoints": true
     }
   ]
 }

@@ -5,6 +5,7 @@ import {
   getRecentCycleLogs,
   getRecentOpportunities,
 } from "../../db/queries";
+import { getCategoryBreakdown, MIN_SAMPLES_FOR_ADJUSTMENT } from "../../lib/strategy/learning";
 import { StatCard } from "../../components/StatCard";
 import { Badge } from "../../components/Badge";
 import { EquityChart } from "../../components/EquityChart";
@@ -16,11 +17,12 @@ export const dynamic = "force-dynamic";
 export default async function OverviewPage() {
   const config = await getBotConfig();
   const mode = config.tradingMode === "live" ? "live" : "paper";
-  const [stats, equity, opportunities, cycleLogs] = await Promise.all([
+  const [stats, equity, opportunities, cycleLogs, categoryBreakdown] = await Promise.all([
     getOverviewStats(mode),
     getEquityCurve(mode),
     getRecentOpportunities(15),
     getRecentCycleLogs(8),
+    getCategoryBreakdown(mode),
   ]);
 
   const equityData = equity.map((e) => ({
@@ -167,6 +169,61 @@ export default async function OverviewPage() {
           </div>
         </section>
       </div>
+
+      <section className="card p-5">
+        <h2 className="mb-1 text-sm font-medium text-text-secondary">Learning by category</h2>
+        <p className="mb-3 text-xs text-text-muted">
+          The bot deliberately paper-trades small, capped bets in categories it hasn&apos;t seen
+          much of yet (below {MIN_SAMPLES_FOR_ADJUSTMENT} closed trades), then sizes future bets
+          up or down per category as a real track record builds.
+        </p>
+        {categoryBreakdown.length === 0 ? (
+          <p className="py-4 text-sm text-text-muted">
+            No closed trades yet — this fills in as positions resolve.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[500px] text-left text-sm">
+              <thead>
+                <tr className="border-b border-[var(--border-hairline)] text-xs uppercase tracking-wide text-text-muted">
+                  <th className="py-2 pr-4 font-medium">Category</th>
+                  <th className="py-2 pr-4 font-medium">Closed trades</th>
+                  <th className="py-2 pr-4 font-medium">Win rate</th>
+                  <th className="py-2 pr-4 font-medium">Avg return</th>
+                  <th className="py-2 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--border-hairline)]">
+                {categoryBreakdown.map((c) => (
+                  <tr key={c.category}>
+                    <td className="py-2 pr-4 text-text-primary">{c.category}</td>
+                    <td className="tabular py-2 pr-4 text-text-secondary">{c.sampleSize}</td>
+                    <td className="tabular py-2 pr-4 text-text-secondary">
+                      {c.winRate === null ? "—" : `${(c.winRate * 100).toFixed(0)}%`}
+                    </td>
+                    <td
+                      className={`tabular py-2 pr-4 ${
+                        (c.avgReturnPct ?? 0) >= 0
+                          ? "text-[var(--status-good)]"
+                          : "text-[var(--status-critical)]"
+                      }`}
+                    >
+                      {c.avgReturnPct === null ? "—" : `${(c.avgReturnPct * 100).toFixed(1)}%`}
+                    </td>
+                    <td className="py-2">
+                      {c.sampleSize >= MIN_SAMPLES_FOR_ADJUSTMENT ? (
+                        <Badge tone="blue">learned, {c.confidenceMultiplier.toFixed(2)}x sizing</Badge>
+                      ) : (
+                        <Badge tone="neutral">still exploring</Badge>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

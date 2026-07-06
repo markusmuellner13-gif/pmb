@@ -1,22 +1,72 @@
 import { and, eq, gte, isNotNull } from "drizzle-orm";
 import { db } from "../db/client";
-import { getBotConfig, updateBotConfig } from "../db/config";
+import { getBotConfig, updateBotConfig, type BotConfig } from "../db/config";
 import { cycleLogs, equityCurve, opportunities as opportunitiesTable, positions } from "../db/schema";
 import { upsertMarketsAndSnapshots, getRecentSnapshotHistory } from "../db/markets";
 import { fetchActiveMarkets, fetchMarketsByConditionIds } from "./polymarket/gamma";
 import type { NormalizedMarket } from "./polymarket/types";
-import { passesLiquidityFilters, scoreMarket, type ScoredOpportunity } from "./strategy/signals";
+import {
+  passesLiquidityFilters,
+  scoreMarket,
+  type ScoredOpportunity,
+  type SnapshotPoint,
+} from "./strategy/signals";
 import { sizeOpportunity, checkExit, checkDailyLossBreaker, type PortfolioState } from "./strategy/risk";
-import { getStrategyPerformance, type StrategyType } from "./strategy/learning";
+import {
+  getStrategyPerformance,
+  getCategoryBreakdown,
+  resolveConfidence,
+  MIN_SAMPLES_FOR_ADJUSTMENT,
+  type StrategyType,
+} from "./strategy/learning";
 import { openPaperPosition, closePaperPosition } from "./execution/paper";
 import { isLiveTradingConfigured, placeLiveMarketOrder } from "./execution/live";
 
 const SCAN_LIMIT = 300;
 const CANDIDATE_LIMIT = 150; // top-N by volume considered for new opportunities each cycle
+const CANDIDATE_PER_CATEGORY_CAP = 25; // keeps one hot event/category from crowding out the rest
 const STALE_LOCK_MS = 5 * 60_000;
+const EXPLORATION_SLOTS_PER_CYCLE = 2;
+const EXPLORATION_MIN_EDGE = 0.005;
+const EXPLORATION_SIZE_FRACTION = 0.2; // of maxPositionUsd -- exploration bets stay small on purpose
 
 function strategyTypeOf(side: ScoredOpportunity["side"]): StrategyType {
   return side === "ARB_BOTH" ? "ARBITRAGE" : "MOMENTUM";
+}
+
+/**
+ * Spreads candidate selection across categories instead of a flat
+ * top-N-by-volume cut, which would otherwise let one enormous event (a
+ * single World Cup market bundle can be 60+ markets) crowd out every other
+ * category. Backfills with remaining highest-volume markets if the caps
+ * leave the limit unfilled.
+ */
+function selectDiverseCandidates(
+  markets: NormalizedMarket[],
+  limit: number,
+  perCategoryCap: number
+): NormalizedMarket[] {
+  const result: NormalizedMarket[] = [];
+  const perCategoryCount = new Map<string, number>();
+
+  for (const m of markets) {
+    if (result.length >= limit) break;
+    const key = m.category ?? "Uncategorized";
+    const count = perCategoryCount.get(key) ?? 0;
+    if (count >= perCategoryCap) continue;
+    perCategoryCount.set(key, count + 1);
+    result.push(m);
+  }
+
+  if (result.length < limit) {
+    const included = new Set(result.map((m) => m.conditionId));
+    for (const m of markets) {
+      if (result.length >= limit) break;
+      if (!included.has(m.conditionId)) result.push(m);
+    }
+  }
+
+  return result;
 }
 
 export interface CycleSummary {
@@ -103,13 +153,31 @@ export async function runCycle(): Promise<CycleSummary> {
       }
     }
 
-    const candidates = scanned.slice(0, CANDIDATE_LIMIT).filter((m) => passesLiquidityFilters(m, config));
+    const candidates = selectDiverseCandidates(
+      scanned.filter((m) => passesLiquidityFilters(m, config)),
+      CANDIDATE_LIMIT,
+      CANDIDATE_PER_CATEGORY_CAP
+    );
     const history = await getRecentSnapshotHistory(candidates.map((m) => m.conditionId));
 
     const [arbPerf, momentumPerf] = await Promise.all([
       getStrategyPerformance("ARBITRAGE", mode),
       getStrategyPerformance("MOMENTUM", mode),
     ]);
+    const confidenceCache = new Map<string, number>();
+    async function confidenceFor(strategyType: StrategyType, category: string | null): Promise<number> {
+      const key = `${strategyType}:${category ?? ""}`;
+      const cached = confidenceCache.get(key);
+      if (cached !== undefined) return cached;
+
+      const strategyPerf = strategyType === "ARBITRAGE" ? arbPerf : momentumPerf;
+      const categoryPerf = category
+        ? await getStrategyPerformance(strategyType, mode, category)
+        : null;
+      const resolved = resolveConfidence(strategyPerf, categoryPerf);
+      confidenceCache.set(key, resolved);
+      return resolved;
+    }
 
     const scored: { market: NormalizedMarket; opportunity: ScoredOpportunity }[] = [];
     for (const market of candidates) {
@@ -153,15 +221,9 @@ export async function runCycle(): Promise<CycleSummary> {
     let positionsOpened = 0;
     for (const { market, opportunity } of scored) {
       const strategyType = strategyTypeOf(opportunity.side);
-      const perf = strategyType === "ARBITRAGE" ? arbPerf : momentumPerf;
+      const confidenceMultiplier = await confidenceFor(strategyType, market.category);
 
-      const sizing = sizeOpportunity(
-        opportunity,
-        market.conditionId,
-        config,
-        portfolio,
-        perf.confidenceMultiplier
-      );
+      const sizing = sizeOpportunity(opportunity, market.conditionId, config, portfolio, confidenceMultiplier);
       if (!sizing.allowed) continue;
 
       try {
@@ -184,6 +246,14 @@ export async function runCycle(): Promise<CycleSummary> {
         console.error(`failed to open position for ${market.conditionId}`, err);
       }
     }
+
+    positionsOpened += await runExplorationPass({
+      candidates,
+      history,
+      config,
+      mode,
+      portfolio,
+    });
 
     if (mode === "paper") {
       await recordEquityCurve("paper");
@@ -249,6 +319,89 @@ async function finish(
   return { status, message, marketsScanned, opportunitiesFound, positionsOpened, positionsClosed, durationMs };
 }
 
+interface ExplorationParams {
+  candidates: NormalizedMarket[];
+  history: Map<string, SnapshotPoint[]>;
+  config: BotConfig;
+  mode: "paper" | "live";
+  portfolio: PortfolioState;
+}
+
+/**
+ * Deliberately spends a small, capped number of paper (or live) trades per
+ * cycle on categories the bot doesn't have much of a track record in yet --
+ * classic explore-vs-exploit. Uses a much lower edge bar than normal trading
+ * (still a real positive edge, just a smaller one) and sizes each bet at a
+ * fraction of the normal max, so exploration can teach the learning loop
+ * about a category without meaningfully risking the (paper) bankroll on it.
+ */
+async function runExplorationPass(params: ExplorationParams): Promise<number> {
+  const { candidates, history, config, mode, portfolio } = params;
+
+  const categoryBreakdown = await getCategoryBreakdown(mode);
+  const sampleSizeByCategory = new Map(categoryBreakdown.map((c) => [c.category, c.sampleSize]));
+
+  const byCategory = new Map<string, NormalizedMarket[]>();
+  for (const m of candidates) {
+    if (portfolio.heldMarketIds.has(m.conditionId)) continue;
+    const key = m.category ?? "Uncategorized";
+    const list = byCategory.get(key) ?? [];
+    list.push(m);
+    byCategory.set(key, list);
+  }
+
+  // Underexplored = fewer than MIN_SAMPLES_FOR_ADJUSTMENT closed trades so
+  // far, including categories never traded at all (absent from the breakdown).
+  const underexplored = [...byCategory.keys()].filter(
+    (cat) => (sampleSizeByCategory.get(cat) ?? 0) < MIN_SAMPLES_FOR_ADJUSTMENT
+  );
+
+  const relaxedConfig: BotConfig = { ...config, minEdgeThreshold: EXPLORATION_MIN_EDGE };
+  let opened = 0;
+
+  for (const category of underexplored) {
+    if (opened >= EXPLORATION_SLOTS_PER_CYCLE) break;
+
+    let best: { market: NormalizedMarket; opportunity: ScoredOpportunity } | null = null;
+    for (const market of byCategory.get(category) ?? []) {
+      const marketHistory = history.get(market.conditionId) ?? [];
+      for (const opp of scoreMarket({ market, history: marketHistory }, relaxedConfig)) {
+        if (!best || opp.edge > best.opportunity.edge) best = { market, opportunity: opp };
+      }
+    }
+    if (!best) continue;
+
+    const strategyType = strategyTypeOf(best.opportunity.side);
+    const sizing = sizeOpportunity(best.opportunity, best.market.conditionId, config, portfolio, 1);
+    if (!sizing.allowed) continue;
+
+    const exploreSizeUsd = Math.min(sizing.sizeUsd, config.maxPositionUsd * EXPLORATION_SIZE_FRACTION);
+    if (exploreSizeUsd < 1) continue;
+
+    try {
+      if (mode === "paper") {
+        await openPaperPosition({
+          market: best.market,
+          opportunity: best.opportunity,
+          strategyType,
+          sizeUsd: exploreSizeUsd,
+          isExploration: true,
+        });
+      } else {
+        await openLivePosition(best.market, best.opportunity, strategyType, exploreSizeUsd, true);
+      }
+      opened++;
+      portfolio.openPositionCount++;
+      portfolio.openExposureUsd += exploreSizeUsd;
+      portfolio.heldMarketIds.add(best.market.conditionId);
+    } catch (err) {
+      console.error(`failed to open exploration position for ${best.market.conditionId}`, err);
+    }
+  }
+
+  return opened;
+}
+
 async function closePosition(
   position: typeof positions.$inferSelect,
   exitPrice: number,
@@ -287,7 +440,8 @@ async function openLivePosition(
   market: NormalizedMarket,
   opportunity: ScoredOpportunity,
   strategyType: StrategyType,
-  sizeUsd: number
+  sizeUsd: number,
+  isExploration = false
 ) {
   if (opportunity.side === "ARB_BOTH") {
     const half = sizeUsd / 2;
@@ -299,7 +453,7 @@ async function openLivePosition(
   }
   // Mirror into our own ledger (positions/trades) using the paper engine's
   // bookkeeping so the dashboard has one consistent data model for both modes.
-  await openPaperPosition({ market, opportunity, strategyType, sizeUsd });
+  await openPaperPosition({ market, opportunity, strategyType, sizeUsd, isExploration });
 }
 
 async function sellLivePosition(
